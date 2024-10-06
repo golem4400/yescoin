@@ -3,6 +3,7 @@ const axios = require('axios');
 const colors = require('colors');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const crypto = require('crypto');
 
 class YesCoinBot {
     constructor(accountIndex, account, proxy) {
@@ -12,6 +13,7 @@ class YesCoinBot {
         this.proxyIP = 'Unknown';
         this.token = null;
         this.config = JSON.parse(fs.readFileSync('config.json', 'utf-8'));
+		this.timeout = 30000;
     }
 
     async log(msg, type = 'info') {
@@ -139,14 +141,19 @@ class YesCoinBot {
         }
     }
 
-    async makeRequest(method, url, data = null, token, proxy) {
-        const headers = this.headers(token);
+    async makeRequest(method, url, data = null, token, proxy, extraHeaders = {}) {
+        const defaultHeaders = this.headers(token);
+        const headers = {
+            ...defaultHeaders,
+            ...extraHeaders
+        };
         const proxyAgent = new HttpsProxyAgent(proxy);
         const config = {
             method,
             url,
             headers,
             httpsAgent: proxyAgent,
+            timeout: this.timeout,
         };
         if (data) {
             config.data = data;
@@ -155,7 +162,10 @@ class YesCoinBot {
             const response = await axios(config);
             return response.data;
         } catch (error) {
-            throw new Error(`Request failed: ${error.message}`);
+            if (error.code === 'ECONNABORTED') {
+                throw new Error(`Yêu cầu hết thời gian sau ${this.timeout}ms`);
+            }
+            throw new Error(`Yêu cầu không thành công: ${error.message}`);
         }
     }
 
@@ -403,6 +413,13 @@ class YesCoinBot {
         }
     }
 
+    generateClaimSign(params, secretKey) {
+        const { id, tm, claimType } = params;
+        const inputString = id + tm + secretKey + claimType;
+        const sign = crypto.createHash('md5').update(inputString).digest('hex');
+        return sign;
+    }
+
     async handleSwipeBot(token, proxy) {
         const url = 'https://api.yescoin.gold/build/getAccountBuildInfo';
         try {
@@ -434,20 +451,51 @@ class YesCoinBot {
                     const offlineBonusInfo = await this.makeRequest('get', offlineBonusUrl, null, token, proxy);
                     if (offlineBonusInfo.code === 0 && offlineBonusInfo.data.length > 0) {
                         const claimUrl = 'https://api.yescoin.gold/game/claimOfflineBonus';
+                        const tm = Math.floor(Date.now() / 1000);
                         const claimData = {
                             id: offlineBonusInfo.data[0].transactionId,
-                            createAt: Math.floor(Date.now() / 1000),
+                            createAt: tm,
                             claimType: 1,
                             destination: ""
                         };
-                        const claimResponse = await this.makeRequest('post', claimUrl, claimData, token, proxy);
+                
+                        const signParams = {
+                            id: claimData.id,
+                            tm: tm,
+                            claimType: claimData.claimType
+                        };
+                
+                        const secretKey = '6863b339db454f5bbd42ffb5b5ac9841';
+                        const sign = this.generateClaimSign(signParams, secretKey);
+                
+                        const headers = {
+                            'Accept': 'application/json, text/plain, */*',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Cache-Control': 'no-cache',
+                            'Content-Type': 'application/json',
+                            'Origin': 'https://www.yescoin.gold',
+                            'Pragma': 'no-cache',
+                            'Referer': 'https://www.yescoin.gold/',
+                            'Sec-Ch-Ua': '"Not.A/Brand";v="8", "Chromium";v="114"',
+                            'Sec-Ch-Ua-Mobile': '?0',
+                            'Sec-Ch-Ua-Platform': '"Windows"',
+                            'Sec-Fetch-Dest': 'empty',
+                            'Sec-Fetch-Mode': 'cors',
+                            'Sec-Fetch-Site': 'same-site',
+                            'Sign': sign,
+                            'Tm': tm.toString(),
+                            'Token': token,
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                        };                        
+                
+                        const claimResponse = await this.makeRequest('post', claimUrl, claimData, token, proxy, headers);
                         if (claimResponse.code === 0) {
                             await this.log(`Claim offline bonus thành công, nhận ${claimResponse.data.collectAmount} coins`, 'success');
                         } else {
-                            await this.log('Claim offline bonus thất bại', 'error');
+                            await this.log(`Claim offline bonus thất bại: ${claimResponse.message}`, 'error');
                         }
                     }
-                }
+                }                
             } else {
                 await this.log('Không thể lấy thông tin SwipeBot', 'error');
             }
@@ -456,138 +504,431 @@ class YesCoinBot {
         }
     }
 
+    async performTaskWithTimeout(task, taskName, timeoutMs = this.timeout) {
+        return new Promise(async (resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                reject(new Error(`${taskName} hết thời gian sau ${timeoutMs}ms`));
+            }, timeoutMs);
+
+            try {
+                const result = await task();
+                clearTimeout(timeoutId);
+                resolve(result);
+            } catch (error) {
+                clearTimeout(timeoutId);
+                reject(error);
+            }
+        });
+    }
+	
     async main() {
         try {
-            this.proxyIP = await this.checkProxyIP(this.proxy);
-        } catch (error) {
-            await this.log(`Error checking proxy IP: ${error.message}`, 'error');
-            return;
-        }
+            try {
+                this.proxyIP = await this.performTaskWithTimeout(
+                    () => this.checkProxyIP(this.proxy),
+                    'Checking proxy IP',
+                    10000
+                );
+                await this.log(`Proxy IP: ${this.proxyIP}`, 'info');
+            } catch (error) {
+                await this.log(`Lỗi kiểm tra IP proxy: ${error.message}`, 'error');
+                return;
+            }
 
-        try {
-            this.token = await this.getOrRefreshToken(this.account, this.proxy);
-        } catch (error) {
-            await this.log(`Không thể lấy token: ${error.message}`, 'error');
-            return;
-        }
+            try {
+                this.token = await this.performTaskWithTimeout(
+                    () => this.getOrRefreshToken(this.account, this.proxy),
+                    'Getting token',
+                    20000
+                );
+            } catch (error) {
+                await this.log(`Không thể lấy token: ${error.message}`, 'error');
+                return;
+            }
 
-        await this.performTasks();
+            await this.performTasks();
+        } catch (error) {
+            await this.log(`Lỗi rồi: ${error.message}`, 'error');
+        } finally {
+            if (!isMainThread) {
+                parentPort.postMessage('taskComplete');
+            }
+        }
     }
 
-    async performTasks() {
-        await this.randomDelay();
-        const nickname = await this.getuser(this.token, this.proxy);
-        await this.log(`Tài khoản: ${nickname}`, 'info');
-        
-        await this.randomDelay();
-        const squadInfo = await this.getSquadInfo(this.token, this.proxy);
-        if (squadInfo && squadInfo.data.isJoinSquad) {
-            const squadTitle = squadInfo.data.squadInfo.squadTitle;
-            const squadMembers = squadInfo.data.squadInfo.squadMembers;
-            await this.log(`Squad: ${squadTitle} | ${squadMembers} Thành viên`, 'info');
-        } else {
-            await this.log('Squad: Bạn không ở trong Squad, gia nhập Dân Cày Airdrop.', 'warning');
-            await this.randomDelay();
-            const joinResult = await this.joinSquad(this.token, "t.me/dancayairdrop", this.proxy);
-            if (joinResult) {
-                await this.log(`Squad: ${nickname} gia nhập Squad thành công !`, 'success');
-            } else {
-                await this.log(`Squad: ${nickname} gia nhập Squad thất bại !`, 'error');
+    async checkAndClaimTaskBonus(token, proxy) {
+    const url = 'https://api-backend.yescoin.gold/task/getFinishTaskBonusInfo';
+    try {
+        const response = await this.makeRequest('get', url, null, token, proxy);
+        if (response.code === 0) {
+        const bonusInfo = response.data;
+        const claimUrl = 'https://api-backend.yescoin.gold/task/claimBonus';
+
+        if (bonusInfo.commonTaskBonusStatus === 1) {
+            const claimResponse = await this.makeRequest('post', claimUrl, 2, token, proxy);
+            if (claimResponse.code === 0) {
+            await this.log(`Claim Common Task bonus thành công | phần thưởng ${claimResponse.data.bonusAmount}`, 'success');
             }
         }
 
-        await this.randomDelay();
-        const balance = await this.getAccountInfo(this.token, this.proxy);
-        if (balance === null) {
-            await this.log('Balance: Không đọc được balance', 'error');
+        if (bonusInfo.dailyTaskBonusStatus === 1) {
+            const claimResponse = await this.makeRequest('post', claimUrl, 1, token, proxy);
+            if (claimResponse.code === 0) {
+            await this.log(`Claim Daily Task bonus thành công | phần thưởng ${claimResponse.data.bonusAmount}`, 'success');
+            }
         }
 
-        const currentAmount = balance.data.currentAmount.toLocaleString().replace(/,/g, '.');
-        await this.randomDelay();
-        const gameInfo = await this.getAccountBuildInfo(this.token, this.proxy);
-        if (gameInfo === null) {
-            await this.log('Không lấy được dữ liệu game!', 'error');
+        if (bonusInfo.commonTaskBonusStatus !== 1 && bonusInfo.dailyTaskBonusStatus !== 1) {
+            await this.log('Chưa đủ điều kiện nhận Task bonus', 'info');
+            return false;
+        }
+
+        return true;
         } else {
-            const { specialBoxLeftRecoveryCount, coinPoolLeftRecoveryCount, singleCoinValue, singleCoinLevel, coinPoolRecoverySpeed, swipeBotLevel } = gameInfo.data;
-            await this.log(`Balance: ${currentAmount} | Booster: Chest ${specialBoxLeftRecoveryCount} | Recovery ${coinPoolLeftRecoveryCount}`, 'info');
-            await this.log(`Multivalue: ${singleCoinValue} | Coin Limit: ${singleCoinLevel} | Fill Rate: ${coinPoolRecoverySpeed} | Swipe Bot: ${swipeBotLevel}`, 'info');
+        await this.log(`Không lấy được thông tin task bonus: ${response.message}`, 'error');
+        return false;
         }
+    } catch (error) {
+        await this.log(`Lỗi khi kiểm tra và claim Task bonus: ${error.message}`, 'error');
+        return false;
+    }
+    }
 
-        await this.randomDelay();
-        await this.handleSwipeBot(this.token, this.proxy);
+    async performDailyMissions(token, proxy) {
+        try {
+            const dailyMissionsUrl = 'https://api-backend.yescoin.gold/mission/getDailyMission';
+            const dailyMissionsResponse = await this.makeRequest('get', dailyMissionsUrl, null, token, proxy);
+    
+            if (dailyMissionsResponse.code === 0) {
+                for (const mission of dailyMissionsResponse.data) {
+                    if (mission.missionStatus === 0) {
 
-        if (this.config.TaskEnable) {
-            await this.randomDelay();
-            await this.processTasks(this.token, this.proxy);
+                        const clickUrl = 'https://api-backend.yescoin.gold/mission/clickDailyMission';
+                        await this.makeRequest('post', clickUrl, mission.missionId, token, proxy);
+    
+                        const checkUrl = 'https://api-backend.yescoin.gold/mission/checkDailyMission';
+                        const checkResponse = await this.makeRequest('post', checkUrl, mission.missionId, token, proxy);
+    
+                        if (checkResponse.code === 0 && checkResponse.data === true) {
+                            const claimUrl = 'https://api-backend.yescoin.gold/mission/claimReward';
+                            const claimResponse = await this.makeRequest('post', claimUrl, mission.missionId, token, proxy);
+    
+                            if (claimResponse.code === 0) {
+                                const reward = claimResponse.data.reward;
+                                await this.log(`Làm nhiệm vụ ${mission.name} thành công | Phần thưởng: ${reward}`, 'success');
+                            } else {
+                                await this.log(`Nhận thưởng nhiệm vụ ${mission.name} thất bại: ${claimResponse.message}`, 'error');
+                            }
+                        } else {
+                            await this.log(`Kiểm tra nhiệm vụ ${mission.name} thất bại`, 'error');
+                        }
+                    }
+                }
+                return true;
+            } else {
+                await this.log(`Không thể lấy danh sách nhiệm vụ hàng ngày: ${dailyMissionsResponse.message}`, 'error');
+                return false;
+            }
+        } catch (error) {
+            await this.log(`Lỗi khi thực hiện nhiệm vụ hàng ngày: ${error.message}`, 'error');
+            return false;
         }
+    }
 
-        if (this.config.upgradeMultiEnable) {
-            await this.randomDelay();
-            await this.upgradeLevel(this.token, gameInfo.data.singleCoinValue, this.config.maxLevel, '1', this.proxy);
-        }
+    generateSign(params, secretKey) {
+        const { id, tm, signInType } = params;
+        const inputString = id + tm + secretKey + signInType;
+        const sign = crypto.createHash('md5').update(inputString).digest('hex');
+        return sign;
+    }
 
-        if (this.config.upgradeFillEnable) {
-            await this.randomDelay();
-            await this.upgradeLevel(this.token, gameInfo.data.coinPoolRecoverySpeed, this.config.maxLevel, '2', this.proxy);
-        }
-
-        await this.randomDelay();
-        const collectInfo = await this.getGameInfo(this.token, this.proxy);
-        if (collectInfo === null) {
-            await this.log('Không lấy được dữ liệu game!', 'error');
-        } else {
-            const { singleCoinValue, coinPoolLeftCount } = collectInfo.data;
-            await this.log(`Năng lượng còn lại ${coinPoolLeftCount}`, 'info');
-
-            if (coinPoolLeftCount > 0) {
-                await this.randomDelay();
-                const amount = Math.floor(coinPoolLeftCount / singleCoinValue);
-                const collectResult = await this.collectCoin(this.token, amount, this.proxy);
-                if (collectResult && collectResult.code === 0) {
-                    const collectedAmount = collectResult.data.collectAmount;
-                    await this.log(`Tap thành công, nhận được ${collectedAmount} coins`, 'success');
+    async performDailySignIn(token, proxy) {
+        try {
+            const secretKey = '6863b339db454f5bbd42ffb5b5ac9841';
+            const getCurrentTimestamp = () => Math.floor(Date.now() / 1000);
+    
+            // Lấy danh sách điểm danh
+            const signInListUrl = 'https://api-backend.yescoin.gold/signIn/list';
+            const signInListResponse = await this.makeRequest('get', signInListUrl, null, token, proxy);
+    
+            if (signInListResponse.code === 0) {
+                const availableSignIn = signInListResponse.data.find(item => item.status === 1);
+    
+                if (availableSignIn) {
+                    const tm = getCurrentTimestamp();
+                    const signInUrl = 'https://api-backend.yescoin.gold/signIn/claim';
+                    const signInData = {
+                        id: availableSignIn.id,
+                        createAt: tm,
+                        signInType: 1,
+                        destination: ""
+                    };
+    
+                    const signParams = {
+                        id: signInData.id,
+                        tm: tm,
+                        signInType: signInData.signInType
+                    };
+    
+                    const sign = this.generateSign(signParams, secretKey);
+    
+                    // Header đầy đủ cho yêu cầu điểm danh
+                    const headers = {
+                        'Accept': 'application/json, text/plain, */*',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Cache-Control': 'no-cache',
+                        'Content-Type': 'application/json',
+                        'Origin': 'https://www.yescoin.gold',
+                        'Pragma': 'no-cache',
+                        'Referer': 'https://www.yescoin.gold/',
+                        'Sec-Ch-Ua': '"Not.A/Brand";v="8", "Chromium";v="114"',
+                        'Sec-Ch-Ua-Mobile': '?0',
+                        'Sec-Ch-Ua-Platform': '"Windows"',
+                        'Sec-Fetch-Dest': 'empty',
+                        'Sec-Fetch-Mode': 'cors',
+                        'Sec-Fetch-Site': 'same-site',
+                        'Sign': sign,
+                        'Tm': tm.toString(),
+                        'Token': token,
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+                    };
+    
+                    const signInResponse = await this.makeRequest('post', signInUrl, signInData, token, proxy, headers);
+                    if (signInResponse.code === 0) {
+                        const reward = signInResponse.data.reward;
+                        await this.log(`Điểm danh hàng ngày thành công | Phần thưởng: ${reward}`, 'success');
+                        return true;
+                    } else {
+                        await this.log(`Điểm danh hàng ngày thất bại: ${JSON.stringify({
+                            code: signInResponse.code,
+                            message: signInResponse.message,
+                            data: signInResponse.data
+                        })}`, 'error');
+                        return false;
+                    }
                 } else {
-                    await this.log('Tap không thành công!', 'error');
+                    await this.log(`Hôm nay bạn đã điểm danh rồi`, 'warning');
+                    return false;
+                }
+            } else {
+                await this.log(`Không thể lấy danh sách điểm danh: ${JSON.stringify({
+                    code: signInListResponse.code,
+                    message: signInListResponse.message,
+                    data: signInListResponse.data
+                })}`, 'error');
+                return false;
+            }
+        } catch (error) {
+            await this.log(`Lỗi khi thực hiện điểm danh hàng ngày: ${error.message}
+            Stack: ${error.stack}
+            Request details: ${JSON.stringify({
+                url: error.config?.url,
+                method: error.config?.method,
+                headers: error.config?.headers,
+                data: error.config?.data
+            })}
+            Response: ${JSON.stringify({
+                status: error.response?.status,
+                data: error.response?.data
+            })}`, 'error');
+            return false;
+        }
+    }    
+
+    async performTasks() {
+        try {
+            const nickname = await this.performTaskWithTimeout(
+                () => this.getuser(this.token, this.proxy),
+                'Getting user info',
+                15000
+            );
+            await this.log(`Tài khoản: ${nickname}`, 'info');
+
+            const squadInfo = await this.performTaskWithTimeout(
+                () => this.getSquadInfo(this.token, this.proxy),
+                'Getting squad info',
+                15000
+            );
+            if (squadInfo && squadInfo.data.isJoinSquad) {
+                const squadTitle = squadInfo.data.squadInfo.squadTitle;
+                const squadMembers = squadInfo.data.squadInfo.squadMembers;
+                await this.log(`Squad: ${squadTitle} | ${squadMembers} Thành viên`, 'info');
+            } else {
+                await this.log('Squad: Bạn không ở trong Squad, gia nhập Dân Cày Airdrop.', 'warning');
+                const joinResult = await this.performTaskWithTimeout(
+                    () => this.joinSquad(this.token, "t.me/dancayairdrop", this.proxy),
+                    'Joining squad',
+                    20000
+                );
+                if (joinResult) {
+                    await this.log(`Squad: ${nickname} gia nhập Squad thành công !`, 'success');
+                } else {
+                    await this.log(`Squad: ${nickname} gia nhập Squad thất bại !`, 'error');
                 }
             }
-        }
 
-        await this.randomDelay();
-        if (gameInfo && gameInfo.data.specialBoxLeftRecoveryCount > 0) {
-            if (await this.useSpecialBox(this.token, this.proxy)) {
-                await this.randomDelay();
-                const collectedAmount = await this.attemptCollectSpecialBox(this.token, 2, 240, this.proxy);
+            await this.performTaskWithTimeout(
+                () => this.performDailySignIn(this.token, this.proxy),
+                'Performing daily sign-in',
+                30000
+            );
+
+            const balance = await this.performTaskWithTimeout(
+                () => this.getAccountInfo(this.token, this.proxy),
+                'Getting account info',
+                15000
+            );
+            if (balance === null) {
+                await this.log('Balance: Không đọc được balance', 'error');
+            } else {
+                const currentAmount = balance.data.currentAmount.toLocaleString().replace(/,/g, '.');
+                await this.log(`Balance: ${currentAmount}`, 'info');
             }
-        }
 
-        await this.randomDelay();
-        const updatedGameInfo = await this.getAccountBuildInfo(this.token, this.proxy);
-        if (updatedGameInfo && updatedGameInfo.data.coinPoolLeftRecoveryCount > 0) {
-            if (await this.recoverCoinPool(this.token, this.proxy)) {
-                await this.randomDelay();
-                const updatedCollectInfo = await this.getGameInfo(this.token, this.proxy);
-                if (updatedCollectInfo) {
-                    const { coinPoolLeftCount, singleCoinValue } = updatedCollectInfo.data;
-                    if (coinPoolLeftCount > 0) {
-                        await this.randomDelay();
-                        const amount = Math.floor(coinPoolLeftCount / singleCoinValue);
-                        const collectResult = await this.collectCoin(this.token, amount, this.proxy);
-                        if (collectResult && collectResult.code === 0) {
-                            const collectedAmount = collectResult.data.collectAmount;
-                            await this.log(`Tap thành công, nhận được ${collectedAmount} coins`, 'success');
-                        } else {
-                            await this.log('Tap không thành công!', 'error');
+            const gameInfo = await this.performTaskWithTimeout(
+                () => this.getAccountBuildInfo(this.token, this.proxy),
+                'Getting game info',
+                15000
+            );
+            if (gameInfo === null) {
+                await this.log('Không lấy được dữ liệu game!', 'error');
+            } else {
+                const { specialBoxLeftRecoveryCount, coinPoolLeftRecoveryCount, singleCoinValue, singleCoinLevel, coinPoolRecoverySpeed, swipeBotLevel } = gameInfo.data;
+                await this.log(`Booster: Chest ${specialBoxLeftRecoveryCount} | Recovery ${coinPoolLeftRecoveryCount}`, 'info');
+                await this.log(`Multivalue: ${singleCoinValue} | Coin Limit: ${singleCoinLevel} | Fill Rate: ${coinPoolRecoverySpeed} | Swipe Bot: ${swipeBotLevel}`, 'info');
+            }
+
+            await this.performTaskWithTimeout(
+                () => this.handleSwipeBot(this.token, this.proxy),
+                'Handling SwipeBot',
+                30000
+            );
+
+            await this.performTaskWithTimeout(
+                () => this.performDailyMissions(this.token, this.proxy),
+                'Performing daily missions',
+                60000
+            );
+            
+            if (this.config.TaskEnable) {
+                await this.performTaskWithTimeout(
+                    () => this.processTasks(this.token, this.proxy),
+                    'Processing tasks',
+                    60000
+                );
+            }
+
+            await this.performTaskWithTimeout(
+                () => this.checkAndClaimTaskBonus(this.token, this.proxy),
+                'Checking and claiming task bonus',
+                30000
+            );
+
+            if (this.config.upgradeMultiEnable && gameInfo) {
+                await this.performTaskWithTimeout(
+                    () => this.upgradeLevel(this.token, gameInfo.data.singleCoinValue, this.config.maxLevel, '1', this.proxy),
+                    'Upgrading Multi',
+                    60000
+                );
+            }
+
+            if (this.config.upgradeFillEnable && gameInfo) {
+                await this.performTaskWithTimeout(
+                    () => this.upgradeLevel(this.token, gameInfo.data.coinPoolRecoverySpeed, this.config.maxLevel, '2', this.proxy),
+                    'Upgrading Fill',
+                    60000
+                );
+            }
+
+            const collectInfo = await this.performTaskWithTimeout(
+                () => this.getGameInfo(this.token, this.proxy),
+                'Getting collect info',
+                15000
+            );
+            if (collectInfo === null) {
+                await this.log('Không lấy được dữ liệu game!', 'error');
+            } else {
+                const { singleCoinValue, coinPoolLeftCount } = collectInfo.data;
+                await this.log(`Năng lượng còn lại ${coinPoolLeftCount}`, 'info');
+
+                if (coinPoolLeftCount > 0) {
+                    const amount = Math.floor(coinPoolLeftCount / singleCoinValue);
+                    const collectResult = await this.performTaskWithTimeout(
+                        () => this.collectCoin(this.token, amount, this.proxy),
+                        'Collecting coins',
+                        30000
+                    );
+                    if (collectResult && collectResult.code === 0) {
+                        const collectedAmount = collectResult.data.collectAmount;
+                        await this.log(`Tap thành công, nhận được ${collectedAmount} coins`, 'success');
+                    } else {
+                        await this.log('Tap không thành công!', 'error');
+                    }
+                }
+            }
+
+            if (gameInfo && gameInfo.data.specialBoxLeftRecoveryCount > 0) {
+                const useSpecialBoxResult = await this.performTaskWithTimeout(
+                    () => this.useSpecialBox(this.token, this.proxy),
+                    'Using special box',
+                    30000
+                );
+                if (useSpecialBoxResult) {
+                    const collectedAmount = await this.performTaskWithTimeout(
+                        () => this.attemptCollectSpecialBox(this.token, 2, 240, this.proxy),
+                        'Collecting from special box',
+                        60000
+                    );
+                    await this.log(`Collected ${collectedAmount} from special box`, 'success');
+                }
+            }
+
+            const updatedGameInfo = await this.performTaskWithTimeout(
+                () => this.getAccountBuildInfo(this.token, this.proxy),
+                'Getting updated game info',
+                15000
+            );
+            if (updatedGameInfo && updatedGameInfo.data.coinPoolLeftRecoveryCount > 0) {
+                const recoverResult = await this.performTaskWithTimeout(
+                    () => this.recoverCoinPool(this.token, this.proxy),
+                    'Recovering coin pool',
+                    30000
+                );
+                if (recoverResult) {
+                    const updatedCollectInfo = await this.performTaskWithTimeout(
+                        () => this.getGameInfo(this.token, this.proxy),
+                        'Getting updated collect info',
+                        15000
+                    );
+                    if (updatedCollectInfo) {
+                        const { coinPoolLeftCount, singleCoinValue } = updatedCollectInfo.data;
+                        if (coinPoolLeftCount > 0) {
+                            const amount = Math.floor(coinPoolLeftCount / singleCoinValue);
+                            const collectResult = await this.performTaskWithTimeout(
+                                () => this.collectCoin(this.token, amount, this.proxy),
+                                'Collecting coins after recovery',
+                                30000
+                            );
+                            if (collectResult && collectResult.code === 0) {
+                                const collectedAmount = collectResult.data.collectAmount;
+                                await this.log(`Tap thành công sau recovery, nhận được ${collectedAmount} coins`, 'success');
+                            } else {
+                                await this.log('Tap không thành công sau recovery!', 'error');
+                            }
                         }
                     }
                 }
             }
-        }
 
-        await this.randomDelay();
-        const freeChestCollectedAmount = await this.attemptCollectSpecialBox(this.token, 1, 200, this.proxy);
+            const freeChestCollectedAmount = await this.performTaskWithTimeout(
+                () => this.attemptCollectSpecialBox(this.token, 1, 200, this.proxy),
+                'Collecting from free chest',
+                30000
+            );
+            await this.log(`Collected ${freeChestCollectedAmount} from free chest`, 'success');
 
-        if (!isMainThread) {
-            parentPort.postMessage('taskComplete');
+        } catch (error) {
+            await this.log(`Error in performTasks: ${error.message}`, 'error');
         }
     }
 }
